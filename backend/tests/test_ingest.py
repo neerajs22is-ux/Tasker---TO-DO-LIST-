@@ -77,8 +77,13 @@ def test_discovery_then_mechanical_then_done_round_sequence(client):
         fields_seen.append([q["field"] for q in working["questions"]])
         answers = []
         for q in working["questions"]:
-            if q["kind"] == "duration":
-                answers.append({"questionId": q["id"], "value": "3"})
+            if q["kind"] == "duration_grid":
+                answers.append(
+                    {
+                        "questionId": q["id"],
+                        "value": {tid: "3" for tid in q["taskIds"]},
+                    }
+                )
             elif q["kind"] == "choice":
                 answers.append({"questionId": q["id"], "value": "Nothing"})
             else:
@@ -313,6 +318,22 @@ def test_small_batch_skips_grouping(client):
     projects = client.get("/api/projects").json()
     assert all(p["name"] != "Core Sprint" for p in projects)
     client.delete(f"/api/import-batches/{data['batch']['id']}")
+
+
+def test_trivial_tasks_skipped_in_discovery(client):
+    class TrivialGamma(MockProvider):
+        def extract_tasks(self, text):
+            base = super().extract_tasks(text)
+            base[2]["guessedDuration"] = 0.25
+            return base
+
+    set_provider(TrivialGamma())
+    batch = ingest_text(client)["batch"]
+
+    gamma_id = str(next(d["id"] for d in batch["drafts"] if d["title"] == "Draft gamma"))
+    question_task_ids = {q["taskId"] for q in batch["questions"]}
+    assert gamma_id not in question_task_ids
+    assert len(batch["questions"]) >= 1
 
 
 def test_progress_log_stored_in_activity(client):

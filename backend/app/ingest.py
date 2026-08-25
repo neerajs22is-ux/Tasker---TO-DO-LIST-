@@ -259,6 +259,16 @@ def stage_drafts(db: Session, source_type: str, payload: str | bytes) -> tuple[I
                 "resolvedDependencyIds": [],
                 "unresolvedReferences": [],
                 "guessed": False,
+                "trivial": bool(item.get("trivial"))
+                or (item["guessedDuration"] is not None and item["guessedDuration"] <= 0.5),
+            }
+        )
+        task.confidence = json.dumps(
+            {
+                "confidence": item["confidence"],
+                "resolvedDependencyIds": [],
+                "unresolvedReferences": [],
+                "guessed": False,
             }
         )
 
@@ -423,10 +433,15 @@ def build_interview_round(db: Session, batch: ImportBatch) -> bool:
 
     if phase == "discovery":
         if state.get("discoveryRounds", 0) < 2:
+            discovery_candidates = [
+                t
+                for t in drafts
+                if not t.confidence or not json.loads(t.confidence).get("trivial", False)
+            ]
             context = {
                 "tasks": [
                     {"id": str(t.id), "title": t.title, "description": t.description or ""}
-                    for t in drafts
+                    for t in discovery_candidates
                 ],
                 "excerpt": (batch.raw_source or "")[:2500],
             }
@@ -444,7 +459,7 @@ def build_interview_round(db: Session, batch: ImportBatch) -> bool:
                             "question": str(q["question"])[:400],
                         }
                     )
-            valid_ids = {str(t.id) for t in drafts}
+            valid_ids = {str(t.id) for t in discovery_candidates}
             questions = [q for q in questions if q["taskId"] in valid_ids]
             if questions:
                 state["pendingQuestions"] = questions
@@ -455,24 +470,25 @@ def build_interview_round(db: Session, batch: ImportBatch) -> bool:
         else:
             state["phase"] = "mechanical"
 
-    if phase == "discovery":
-        pass
-
-    mechanical: list[dict] = []
-    for task in drafts:
-        gap = _next_gap_for_task(task, asked_fields)
-        if gap is None:
-            continue
-        fallback = _fallback_question(task.id, task.title, gap["field"])
-        mechanical.append(fallback)
-        if len(mechanical) >= 4:
-            break
-
-    if mechanical:
-        state["pendingQuestions"] = mechanical
-        batch.interview_state = json.dumps(state)
-        db.commit()
-        return True
+    if state.get("phase") == "mechanical":
+        need_duration = [
+            t
+            for t in drafts
+            if t.duration_estimate is None and f"{t.id}:duration" not in asked_fields
+        ]
+        if need_duration:
+            grid = {
+                "id": "duration-grid",
+                "taskId": str(need_duration[0].id),
+                "field": "duration",
+                "kind": "duration_grid",
+                "question": f"Set effort (hours) for {len(need_duration)} quest(s):",
+                "taskIds": [str(t.id) for t in need_duration],
+            }
+            state["pendingQuestions"] = [grid]
+            batch.interview_state = json.dumps(state)
+            db.commit()
+            return True
 
     state["phase"] = "done"
     if drafts and not state.get("checkinDone") and not state.get("skippedAll"):
@@ -514,92 +530,145 @@ AFFIRMATIONS = {
 }
 
 
+def _apply_discovery(
+    db: Session,
+    batch: ImportBatch,
+    task: Task | None,
+    text_value: str,
+    counters: dict,
+) -> None:
+    if text_value.lower() in AFFIRMATIONS or text_value == "":
+        return
+    if task is None:
+        return
+    result = get_provider().interpret_answer(
+        {"id": task.id, "title": task.title, "description": task.description},
+        text_value,
+    )
+    action = result.get("action")
+    if action == "split" and result.get("split"):
+        for part in result["split"][:4]:
+            if not isinstance(part, dict) or not part.get("title"):
+                continue
+            _clone_draft(db, batch, task, str(part["title"]), part.get("description"))
+            counters["splits_created"] += 1
+        db.delete(task)
+    elif action == "add_task" and isinstance(result.get("task"), dict):
+        _clone_draft(
+            db,
+            batch,
+            task,
+            str(result["task"].get("title", "New quest")),
+            result["task"].get("description"),
+        )
+        counters["tasks_added"] += 1
+    elif action == "add_dependency":
+        prereq_title = str(result.get("prerequisiteTitle", ""))[:120]
+        prereq = _find_or_create_prerequisite(db, batch, prereq_title)
+        blob = json.loads(task.confidence or "{}")
+        candidates = blob.get("resolvedDependencyIds", [])
+        if prereq.id not in candidates and prereq.id != task.id:
+            candidates.append(prereq.id)
+            blob["resolvedDependencyIds"] = candidates
+            task.confidence = json.dumps(blob)
+            state = json.loads(batch.interview_state or "{}")
+            state.setdefault("depCandidates", []).append(
+                {
+                    "dependentId": task.id,
+                    "prerequisiteId": prereq.id,
+                    "reason": str(result.get("reason", ""))[:300] or text_value[:200],
+                    "accepted": True,
+                }
+            )
+            batch.interview_state = json.dumps(state)
+        counters["dependencies_added"] += 1
+    else:
+        update = result.get("update") or {}
+        if update.get("title"):
+            task.title = str(update["title"])[:255]
+        if update.get("description"):
+            task.description = str(update["description"])
+
+
 def answer_questions(db: Session, batch: ImportBatch, answers: list[dict]) -> dict:
     state = json.loads(batch.interview_state or "{}")
     pending = {q["id"]: q for q in state.get("pendingQuestions", [])}
-    applied = 0
-    splits_created = 0
-    tasks_added = 0
-    dependencies_added = 0
+    counters = {"applied": 0, "splits_created": 0, "tasks_added": 0, "dependencies_added": 0}
 
     for answer in answers:
         question = pending.get(answer.get("questionId", ""))
         if not question or question.get("status") == "answered":
             continue
-        task = db.get(Task, int(question["taskId"]))
-        if task is not None and task.status != "draft":
-            task = None
+        apply_similar = bool(answer.get("applySimilar"))
         value = answer.get("value")
         text_value = value.strip() if isinstance(value, str) else ""
 
-        if question["field"] == "duration":
+        if question["kind"] == "duration_grid":
+            mapping = value if isinstance(value, dict) else {}
+            id_list = [str(t) for t in question.get("taskIds", [])]
+            fallback = mapping.get("*")
+            for tid in id_list:
+                raw = mapping.get(tid, fallback)
+                try:
+                    hours = max(0.25, float(raw))
+                except (TypeError, ValueError):
+                    hours = DEFAULT_DURATION_HOURS
+                t = db.get(Task, int(tid))
+                if t is not None and t.status == "draft":
+                    t.duration_estimate = hours
+                    _set_confidence(t, "duration", 1.0)
+
+        elif question["field"] == "duration":
             try:
                 hours = max(0.25, float(value))
             except (TypeError, ValueError):
                 hours = DEFAULT_DURATION_HOURS
-            if task is not None:
-                task.duration_estimate = hours
-                _set_confidence(task, "duration", 1.0)
+            if task := db.get(Task, int(question["taskId"])):
+                if task.status == "draft":
+                    task.duration_estimate = hours
+                    _set_confidence(task, "duration", 1.0)
 
         elif question["field"] == "discovery":
-            if text_value.lower() in AFFIRMATIONS or text_value == "":
-                pass
-            elif task is not None:
-                result = get_provider().interpret_answer(
-                    {"id": task.id, "title": task.title, "description": task.description},
-                    text_value,
-                )
-                action = result.get("action")
-                if action == "split" and result.get("split"):
-                    for part in result["split"][:4]:
-                        if not isinstance(part, dict) or not part.get("title"):
-                            continue
-                        clone = _clone_draft(db, batch, task, str(part["title"]), part.get("description"))
-                        splits_created += 1
-                    db.delete(task)
-                elif action == "add_task" and isinstance(result.get("task"), dict):
-                    _clone_draft(
-                        db,
-                        batch,
-                        task,
-                        str(result["task"].get("title", "New quest")),
-                        result["task"].get("description"),
-                    )
-                    tasks_added += 1
-                elif action == "add_dependency":
-                    prereq_title = str(result.get("prerequisiteTitle", ""))[:120]
-                    prereq = _find_or_create_prerequisite(db, batch, prereq_title)
-                    blob = json.loads(task.confidence or "{}")
-                    candidates = blob.get("resolvedDependencyIds", [])
-                    if prereq.id not in candidates and prereq.id != task.id:
-                        candidates.append(prereq.id)
-                        blob["resolvedDependencyIds"] = candidates
-                        task.confidence = json.dumps(blob)
-                        state.setdefault("depCandidates", []).append(
-                            {
-                                "dependentId": task.id,
-                                "prerequisiteId": prereq.id,
-                                "reason": str(result.get("reason", ""))[:300] or text_value[:200],
-                                "accepted": True,
-                            }
-                        )
-                    dependencies_added += 1
-                else:
-                    update = result.get("update") or {}
-                    if update.get("title"):
-                        task.title = str(update["title"])[:255]
-                    if update.get("description"):
-                        task.description = str(update["description"])
+            target = db.get(Task, int(question["taskId"]))
+            if target is not None and target.status != "draft":
+                target = None
+            self_text = text_value
+
+            if apply_similar:
+                siblings = [
+                    q2
+                    for q2 in pending.values()
+                    if q2["field"] == "discovery"
+                    and q2["id"] != question["id"]
+                    and q2.get("status") != "answered"
+                ][:3]
+            else:
+                siblings = []
+
+            _apply_discovery(db, batch, target, self_text, counters)
+            for sib in siblings:
+                sib_task = db.get(Task, int(sib["taskId"]))
+                if sib_task is not None and sib_task.status == "draft":
+                    before_title = sib_task.title
+                    _apply_discovery(db, batch, sib_task, self_text, counters)
+                    if sib_task.title != before_title or sib_task not in db.new:
+                        counters["tasks_added"] += 0
+                sib["status"] = "answered"
+                sib["answer"] = (self_text or "")[:500]
+                counters["applied"] += 1
 
         elif text_value or value is not None:
-            if task is not None and question["field"] in ("scope", "priority", "dependencies"):
-                _set_confidence(task, question["field"], 1.0)
-                if question["field"] == "scope":
-                    task.description = text_value or task.description
+            if (task := db.get(Task, int(question["taskId"]))) and task.status == "draft":
+                if question["field"] in ("scope", "priority", "dependencies"):
+                    _set_confidence(task, question["field"], 1.0)
+                    if question["field"] == "scope":
+                        task.description = text_value or task.description
 
         question["status"] = "answered"
-        question["answer"] = (text_value or str(value))[:500]
-        applied += 1
+        question["answer"] = (
+            json.dumps(value) if isinstance(value, dict) else (text_value or str(value))
+        )[:500]
+        counters["applied"] += 1
 
     db.commit()
 
@@ -613,10 +682,10 @@ def answer_questions(db: Session, batch: ImportBatch, answers: list[dict]) -> di
         more = build_interview_round(db, batch)
 
     return {
-        "applied": applied,
-        "splitsCreated": splits_created,
-        "tasksAdded": tasks_added,
-        "dependenciesAdded": dependencies_added,
+        "applied": counters["applied"],
+        "splitsCreated": counters["splits_created"],
+        "tasksAdded": counters["tasks_added"],
+        "dependenciesAdded": counters["dependencies_added"],
         "moreQuestions": more,
     }
 

@@ -57,10 +57,11 @@ export interface DraftTask {
 export interface InterviewQuestion {
   id: string
   taskId: string
-  field: ConfidenceField
+  field: ConfidenceField | 'discovery'
   question: string
-  kind: 'duration' | 'choice' | 'text'
+  kind: 'duration' | 'choice' | 'text' | 'duration_grid'
   options?: string[]
+  taskIds?: string[]
 }
 
 export interface DepCandidate {
@@ -88,9 +89,12 @@ export interface ImportBatch {
   drafts: DraftTask[]
 }
 
+export type AnswerValue = string | number | Record<string, number | string>
+
 export interface AnswerPayload {
   questionId: string
-  value: string | string[] | number
+  value: AnswerValue
+  applySimilar?: boolean
 }
 
 export interface Edge {

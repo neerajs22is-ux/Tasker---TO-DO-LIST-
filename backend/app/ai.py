@@ -18,6 +18,9 @@ Return ONLY a JSON object {"tasks":[...]} where each task has:
 - rawContext: the original wording this came from
 - guessedDuration: effort in HOURS as a number, or null
 - guessedPriority: integer 1-5, or null
+- trivial: true when the task is a purely logistical/scheduled action with an obvious
+  execution path (attend a meeting at a set time, pay a bill, send a file, book a known
+  appointment). false for anything requiring preparation, judgment or creation.
 - confidence: object {duration, priority, scope} each 0-1
 Rules:
 - Only genuinely distinct pieces of work become separate tasks.
@@ -35,13 +38,17 @@ Return ONLY JSON {"dependencies":[{"prerequisiteId":"<id>","dependentId":"<id>",
 JSON only."""
 
 DISCOVERY_PROMPT = """You are a meticulous project manager running a quick discovery check-in.
-Given the draft tasks and an excerpt of the original notes, find the riskiest ASSUMPTIONS and
-hidden PREREQUISITES people usually miss. Ask about the real world, e.g.:
-"Get 3 LinkedIn recommendations" -> "Is your profile fully up to date?" / "Are you already
-connected with all three people?"
+Given draft tasks and the original notes excerpt, ask ONLY questions whose ANSWERS WOULD
+CHANGE THE PLAN: create a new quest, remove one, reorder, or add a dependency.
+
+STRICT RULES:
+- NEVER ask about scheduled or logistical trivia: whether something is booked/fixed,
+  transport, reminders, calendar checks. If a task is an obvious errand or event
+  (attend a meeting at 12, pay a bill, send a file), it gets NO questions.
+- Only ask when the answer could realistically alter what gets built or in what order.
+- Max 3 questions total, specific to THESE tasks and notes.
 Return ONLY JSON {"questions":[{"id":"q1","taskId":"<id>","question":"..."}],"done":false}.
-- Max 3 questions. Open-ended, specific to THESE tasks, not estimates or dates.
-- When nothing meaningful remains, return {"questions":[],"done":true}.
+If nothing passes the bar, return {"questions":[],"done":true}.
 JSON only."""
 
 ANSWER_INTERPRET_PROMPT = """A user answered a discovery question about their draft task.
@@ -58,12 +65,25 @@ Decide what plan-change their answer implies and return ONLY JSON, one action:
 JSON only."""
 
 
-GROUP_PROMPT = """You cluster extracted tasks into meaningful PROJECTS.
+GROUP_THEMES_PROMPT = """You cluster extracted tasks into meaningful PROJECTS.
 Input: tasks with ids, titles, context. Return ONLY JSON {"groups":[{"name":"<short project name>","taskIds":["<id>",...]}]}.
 Rules:
 - 2 to 5 groups maximum, each with a punchy uppercase-friendly name (max 40 chars).
 - EVERY task id must appear in exactly one group. Use a group named "General" as catch-all if needed.
 - Group by theme/domain (e.g. Website, Marketing, Admin), never by status or order.
+JSON only."""
+
+
+GROUP_THEMES_PROMPT = """You cluster extracted tasks into meaningful PROJECTS.
+Step 1: identify the distinct DOMAINS/THEMES present across ALL tasks (different deliverables,
+audiences, or life-areas — never status or order). Most mixed documents contain 2-5 themes;
+a genuinely single-domain document has exactly 1.
+Return ONLY JSON {"themes":[{"name":"<short name, max 40 chars>","why":"<one line>"}]}.
+JSON only."""
+
+GROUP_ASSIGN_PROMPT = """Assign every task to exactly one of the given themes.
+Return ONLY JSON {"assignment":[{"taskId":"<id>","theme":"<exact theme name>"}]}.
+Every taskId must appear exactly once. Theme names must match the provided list verbatim.
 JSON only."""
 
 
@@ -79,12 +99,14 @@ class LLMProvider(Protocol):
         ...
     def discover_questions(self, context: dict) -> dict:
         ...
+    def discover_questions(self, context: dict) -> dict:
+        ...
+
     def group_tasks(self, tasks: list[dict]) -> dict:
         ...
 
     def discover_questions(self, context: dict) -> dict:
         ...
-
 
 def _extract_json(content: str) -> dict:
     content = content.strip()
@@ -126,6 +148,7 @@ def validate_extraction(data: dict) -> list[dict]:
                 "rawContext": str(t.get("rawContext") or "")[:2000],
                 "guessedDuration": _num_or_none(t.get("guessedDuration")),
                 "guessedPriority": _int_or_none(t.get("guessedPriority")),
+                "trivial": bool(t.get("trivial", False)),
                 "confidence": {
                     key: max(0.0, min(1.0, float(conf.get(key, 0.0) or 0.0)))
                     for key in ("duration", "priority", "scope")
@@ -199,34 +222,68 @@ class GroqProvider:
         except (ValueError, json.JSONDecodeError):
             return {"questions": [], "done": True}
 
-    def group_tasks(self, tasks: list[dict]) -> dict:
-        slim = [{"id": str(t["id"]), "title": t["title"], "context": (t.get("rawContext") or "")[:150]} for t in tasks]
-        user = json.dumps({"tasks": slim})
+    def _complete_json_with_retry(self, model: str, system: str, user: str, retry_hint: str) -> dict:
         try:
-            data = self._complete_json(EXTRACTION_MODEL, GROUP_PROMPT, user)
+            return self._complete_json(model, system, user)
         except (ValueError, json.JSONDecodeError):
-            data = self._complete_json(
-                EXTRACTION_MODEL,
-                GROUP_PROMPT,
-                user,
-                retry_hint='Respond again with ONLY valid JSON {"groups":[{"name":"...","taskIds":["..."]}]}',
-            )
-        valid_ids = {str(t["id"]) for t in tasks}
-        groups = []
-        seen_ids: set[str] = set()
-        for g in data.get("groups", [])[:5]:
-            name = str(g.get("name", "")).strip()[:40]
-            ids = [str(i) for i in (g.get("taskIds") or []) if str(i) in valid_ids and str(i) not in seen_ids]
-            if not name or not ids:
-                continue
-            seen_ids.update(ids)
-            groups.append({"name": name, "taskIds": ids})
-        leftovers = [i for i in valid_ids if i not in seen_ids]
-        if leftovers and len(groups) < 5:
-            groups.append({"name": "General", "taskIds": leftovers})
-        elif leftovers:
-            groups[-1]["taskIds"].extend(leftovers)
-        return {"groups": groups}
+            return self._complete_json(model, system, user, retry_hint=retry_hint)
+
+    def group_tasks(self, tasks: list[dict]) -> dict:
+        slim = [
+            {"id": str(t["id"]), "title": t["title"], "context": (t.get("rawContext") or "")[:150]}
+            for t in tasks
+        ]
+        user = json.dumps({"tasks": slim})
+
+        themes_data = self._complete_json_with_retry(
+            EXTRACTION_MODEL,
+            GROUP_THEMES_PROMPT,
+            user,
+            'Respond again with ONLY {"themes":[{"name":"...","why":"..."}]}',
+        )
+        themes = [
+            {"name": str(t.get("name", "")).strip()[:40], "why": str(t.get("why", ""))[:200]}
+            for t in themes_data.get("themes", [])
+            if isinstance(t, dict) and str(t.get("name", "")).strip()
+        ]
+        if not themes:
+            return {
+                "groups": [{"name": "General", "taskIds": [str(t["id"]) for t in tasks]}],
+                "monolithic": True,
+            }
+        themes = themes[:6]
+
+        assign_user = json.dumps({"themes": [t["name"] for t in themes], "tasks": slim})
+        assign_data = self._complete_json_with_retry(
+            INTERVIEW_MODEL,
+            GROUP_ASSIGN_PROMPT,
+            assign_user,
+            'Respond again with ONLY {"assignment":[{"taskId":"...","theme":"..."}]}',
+        )
+
+        theme_names = {t["name"] for t in themes}
+        groups: dict[str, list[str]] = {t["name"]: [] for t in themes}
+        groups.setdefault("General", [])
+        seen: set[str] = set()
+        for a in assign_data.get("assignment", []):
+            tid = str(a.get("taskId", ""))
+            theme = str(a.get("theme", "")).strip()
+            if tid in valid_ids(tasks) and tid not in seen:
+                matched = next((n for n in theme_names if n.lower() == theme.lower()), None)
+                target = matched or "General"
+                groups.setdefault(target, []).append(tid)
+                seen.add(tid)
+        for t in tasks:
+            tid = str(t["id"])
+            if tid not in seen:
+                groups[themes[0]["name"]].append(tid)
+                seen.add(tid)
+
+        non_empty = [{"name": name, "taskIds": ids} for name, ids in groups.items() if ids]
+        return {
+            "groups": sorted(non_empty, key=lambda g: -len(g["taskIds"])),
+            "monolithic": len(non_empty) == 1,
+        }
 
     def interpret_answer(self, task_payload: dict, answer: str) -> dict:
         user = json.dumps({"task": task_payload, "answer": answer})
@@ -244,7 +301,6 @@ class MockProvider:
     def __init__(self) -> None:
         self.extract_calls = 0
         self.discover_calls = 0
-
     def extract_tasks(self, text: str) -> list[dict]:
         self.extract_calls += 1
         marker = "MOCK_SPLIT" in text
@@ -327,12 +383,19 @@ class MockProvider:
         return {"action": "update", "update": {"description": answer}}
 
     def group_tasks(self, tasks: list[dict]) -> dict:
-        half = max(1, len(tasks) // 2)
-        groups = [
-            {"name": "Core Sprint", "taskIds": [str(t["id"]) for t in tasks[:half]]},
-            {"name": "Support Work", "taskIds": [str(t["id"]) for t in tasks[half:]]},
-        ]
-        return {"groups": [g for g in groups if g["taskIds"]]}
+        ids = [str(t["id"]) for t in tasks]
+        half = max(1, len(ids) // 2)
+        return {
+            "groups": [
+                {"name": "Core Sprint", "taskIds": ids[:half]},
+                {"name": "Support Work", "taskIds": ids[half:]},
+            ],
+            "monolithic": False,
+        }
+
+
+def valid_ids(tasks: list[dict]) -> set:
+    return {str(t["id"]) for t in tasks}
 
 
 _provider_lock = threading.Lock()

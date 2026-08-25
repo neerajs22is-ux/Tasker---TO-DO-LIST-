@@ -110,7 +110,10 @@ export function CaptureSpace() {
   const [file, setFile] = useState<File | null>(null)
   const [lineIndex, setLineIndex] = useState(0)
   const [transcript, setTranscript] = useState<TranscriptEntry[]>([])
-  const [currentAnswer, setCurrentAnswer] = useState<string | string[]>('')
+  const [currentAnswer, setCurrentAnswer] = useState<
+    string | string[] | Record<string, string>
+  >('')
+  const [applySimilar, setApplySimilar] = useState(false)
   const [sending, setSending] = useState(false)
   const [accepted, setAccepted] = useState<Record<number, number[]>>({})
   const [depToggles, setDepToggles] = useState<Record<number, number[]>>({})
@@ -118,6 +121,11 @@ export function CaptureSpace() {
   const scrollRef = useRef<HTMLDivElement>(null)
 
   const questions = batch?.questions ?? []
+  const activeQuestion = questions[0]
+  const siblingCount =
+    activeQuestion?.field === 'discovery' || activeQuestion?.kind === 'duration_grid'
+      ? Math.max(0, questions.length - 1)
+      : 0
 
   useEffect(() => {
     if (captureStep !== 'extracting') return
@@ -129,24 +137,55 @@ export function CaptureSpace() {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' })
   }, [transcript.length, sending])
 
+  useEffect(() => {
+    setApplySimilar(false)
+    if (activeQuestion?.kind === 'duration_grid') {
+      const rows: Record<string, string> = {}
+      for (const tid of activeQuestion.taskIds ?? []) rows[tid] = ''
+      setCurrentAnswer(rows)
+    } else {
+      setCurrentAnswer('')
+    }
+  }, [activeQuestion?.id])
+
   const canSend = useMemo(() => {
-    if (questions.length === 0 || sending) return false
+    if (!activeQuestion || sending) return false
     const v = currentAnswer
-    if (Array.isArray(v)) return v.length > 0
+    if (typeof v === 'object') {
+      return Object.values(v).some((x) => x !== '' && x != null)
+    }
     return typeof v === 'string' && v.trim().length > 0
-  }, [currentAnswer, questions.length, sending])
+  }, [currentAnswer, activeQuestion, sending])
 
   async function sendAnswer() {
-    const q = questions[0]
+    const q = activeQuestion
     if (!q || !canSend) return
-    const value = currentAnswer
+    let value: string | Record<string, string> = ''
+    if (typeof currentAnswer === 'object') {
+      value = Object.fromEntries(Object.entries(currentAnswer).filter(([, v]) => v !== ''))
+      value['*'] =
+        (Object.entries(currentAnswer).find(([, v]) => v !== '')?.[1] as string) ?? '1'
+    } else {
+      value = currentAnswer
+    }
     setSending(true)
+    const summaryText =
+      typeof value === 'object'
+        ? Object.entries(value)
+            .map(([tid, h]) => {
+              const d = batch?.drafts.find((x) => x.id === Number(tid))
+              return `${d?.title ?? tid}: ${h}h`
+            })
+            .join(' · ')
+        : String(value)
     setTranscript((t) => [
       ...t,
-      { id: `u-${q.id}`, role: 'user', text: Array.isArray(value) ? value.join(', ') : String(value) },
+      { id: `u-${q.id}`, role: 'user', text: summaryText },
     ])
     setCurrentAnswer('')
-    await answerBatchAction([{ questionId: q.id, value }])
+    await answerBatchAction([
+      { questionId: q.id, value, applySimilar: applySimilar || undefined },
+    ])
     setSending(false)
   }
 
@@ -169,7 +208,7 @@ export function CaptureSpace() {
     setDepToggles({})
     setCaptureStep('forged')
     setTimeout(() => {
-      setView('graph')
+      setView('nextup')
       setCaptureStep('source')
       setTranscript([])
     }, 2100)
@@ -342,40 +381,69 @@ export function CaptureSpace() {
                       </div>
                     </div>
                   ))}
-                  {questions[0] && (
+                  {activeQuestion && (
                     <div className="flex items-start gap-2 border-[3px] border-black bg-secondary p-3.5 shadow-[3px_3px_0_0_#000]">
                       <Bot className="mt-0.5 size-4 shrink-0 stroke-[3]" />
                       <div className="min-w-0 flex-1">
-                        <p className="text-sm font-bold">{questions[0].question}</p>
+                        <p className="text-sm font-bold">{activeQuestion.question}</p>
                         {(() => {
-                          const task = batch?.drafts.find((d) => d.id === Number(questions[0].taskId))
-                          return task ? (
-                            <p className="mt-0.5 text-xs text-muted-foreground">about “{task.title}”</p>
+                          const task = batch?.drafts.find((d) => d.id === Number(activeQuestion.taskId))
+                          return task && activeQuestion.kind !== 'duration_grid' ? (
+                            <p className="mt-0.5 text-xs font-medium">about “{task.title}”</p>
                           ) : null
                         })()}
                       </div>
                     </div>
                   )}
                   {sending && (
-                    <div className="flex items-center gap-2 pl-1 text-muted-foreground">
+                    <div className="flex items-center gap-2 pl-1 font-bold">
                       <span className="flex gap-1">
                         {[0, 1, 2].map((i) => (
                           <motion.span
                             key={i}
-                            className="size-1.5 rounded-full bg-violet-300"
-                            animate={{ y: [0, -4, 0] }}
-                            transition={{ duration: 0.7, repeat: Infinity, delay: i * 0.15 }}
+                            className="size-1.5 bg-black"
+                            animate={{ y: [0, -5, 0] }}
+                            transition={{ duration: 0.6, repeat: Infinity, delay: i * 0.15, ease: 'linear' }}
                           />
                         ))}
                       </span>
-                      thinking…
+                      THINKING…
                     </div>
                   )}
                 </div>
 
-                {questions[0] && !sending && (
-                  <div className="rounded-xl border border-border bg-card/70 p-3">
-                    {questions[0].kind === 'duration' && (
+                {activeQuestion && !sending && (
+                  <div className="border-[3px] border-black bg-white p-3 neo-shadow-sm">
+                    {activeQuestion.kind === 'duration_grid' && (
+                      <div className="space-y-2">
+                        {(activeQuestion.taskIds ?? []).map((tid) => {
+                          const draft = batch?.drafts.find((d) => d.id === Number(tid))
+                          const rows = (currentAnswer as Record<string, string>) || {}
+                          return (
+                            <div key={tid} className="flex items-center gap-2">
+                              <span className="min-w-0 flex-1 truncate text-sm font-bold">
+                                {draft?.title ?? tid}
+                              </span>
+                              <Input
+                                type="number"
+                                min="0.25"
+                                step="0.25"
+                                placeholder="hrs"
+                                value={rows[tid] ?? ''}
+                                onChange={(e) =>
+                                  setCurrentAnswer((prev) => ({
+                                    ...(typeof prev === 'object' && prev !== null && !Array.isArray(prev) ? prev : {}),
+                                    [tid]: e.target.value,
+                                  }))
+                                }
+                                className="h-10 w-24 shrink-0 text-center"
+                              />
+                            </div>
+                          )
+                        })}
+                      </div>
+                    )}
+                    {activeQuestion.kind === 'duration' && (
                       <Input
                         autoFocus
                         type="number"
@@ -387,12 +455,13 @@ export function CaptureSpace() {
                         onKeyDown={(e) => e.key === 'Enter' && void sendAnswer()}
                       />
                     )}
-                    {questions[0].kind === 'choice' && (
+                    {activeQuestion.kind === 'choice' && (
                       <div className="flex flex-wrap gap-1.5">
-                        {(questions[0].options ?? []).map((opt) => {
-                          const multi = questions[0].field === 'dependencies'
-                          const arr = multi && Array.isArray(currentAnswer) ? currentAnswer : []
-                          const checked = multi ? arr.includes(opt) : currentAnswer === opt
+                        {(activeQuestion.options ?? []).map((opt) => {
+                          const multi = activeQuestion.field === 'dependencies'
+                          const current = typeof currentAnswer === 'string' ? currentAnswer : ''
+                          const arr = multi && Array.isArray(currentAnswer) ? (currentAnswer as unknown as string[]) : []
+                          const checked = multi ? arr.includes(opt) : current === opt
                           return (
                             <button
                               key={opt}
@@ -403,10 +472,10 @@ export function CaptureSpace() {
                                 )
                               }}
                               className={cn(
-                                'flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs transition-colors',
+                                'flex items-center gap-1.5 border-2 border-black px-2.5 py-1 text-xs font-bold transition-colors',
                                 checked
-                                  ? 'border-primary/60 bg-primary/15 text-primary'
-                                  : 'border-border hover:bg-secondary/50',
+                                  ? 'bg-secondary'
+                                  : 'bg-white hover:bg-muted',
                               )}
                             >
                               {checked && <Check className="size-3" />} {opt}
@@ -415,22 +484,34 @@ export function CaptureSpace() {
                         })}
                       </div>
                     )}
-                    {questions[0].kind === 'text' && (
-                      <Textarea
-                        autoFocus
-                        rows={2}
-                        placeholder="Answer in your own words…"
-                        value={(currentAnswer as string) || ''}
-                        onChange={(e) => setCurrentAnswer(e.target.value)}
-                      />
+                    {activeQuestion.kind === 'text' && (
+                      <>
+                        <Textarea
+                          autoFocus
+                          rows={2}
+                          placeholder="Answer in your own words…"
+                          value={(currentAnswer as string) || ''}
+                          onChange={(e) => setCurrentAnswer(e.target.value)}
+                        />
+                        {siblingCount > 0 && (
+                          <label className="mt-2 flex cursor-pointer items-center gap-2 text-xs font-bold uppercase tracking-wide">
+                            <Checkbox
+                              checked={applySimilar}
+                              onCheckedChange={(v) => setApplySimilar(v === true)}
+                            />
+                            Apply this answer to {siblingCount} similar question
+                            {siblingCount === 1 ? '' : 's'}
+                          </label>
+                        )}
+                      </>
                     )}
-                    <Button size="sm" className="mt-2 w-full" disabled={!canSend} onClick={() => void sendAnswer()}>
-                      <Send /> Send
+                    <Button size="sm" className="mt-3 w-full" disabled={!canSend} onClick={() => void sendAnswer()}>
+                      <Send /> Send{typeof currentAnswer === 'object' && Object.keys(currentAnswer).length > 0 ? ` (${Object.values(currentAnswer).filter((v) => v !== '').length} set)` : ''}
                     </Button>
                   </div>
                 )}
 
-                {!questions[0] && !sending && (
+                {!activeQuestion && !sending && (
                   <Button variant="outline" className="w-full" onClick={() => setCaptureStep('review')}>
                     Continue to review
                   </Button>
