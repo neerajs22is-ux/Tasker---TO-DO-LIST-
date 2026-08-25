@@ -1,0 +1,237 @@
+@import '@xyflow/react/dist/style.css';
+@import "tailwindcss";
+
+:root {
+  --background: #fffdf5;
+  --foreground: #000000;
+  --card: #ffffff;
+  --card-foreground: #000000;
+  --popover: #fffdf5;
+  --popover-foreground: #000000;
+  --primary: #ff6b6b;
+  --primary-foreground: #000000;
+  --secondary: #ffd93d;
+  --secondary-foreground: #000000;
+  --muted: #c4b5fd;
+  --muted-foreground: #000000;
+  --accent: #c4b5fd;
+  --accent-foreground: #000000;
+  --destructive: #ff6b6b;
+  --destructive-foreground: #000000;
+  --border: #000000;
+  --input: #000000;
+  --ring: #000000;
+  --radius: 0rem;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --radius-sm: calc(var(--radius));
+  --radius-md: calc(var(--radius));
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius));
+
+  --font-sans: "Space Grotesk", ui-sans-serif, system-ui, sans-serif;
+
+  --animate-spin-slow: spin-slow 10s linear infinite;
+  --animate-hard-pulse: hard-pulse 1.2s steps(2, end) infinite;
+  --animate-flame: flame-flicker 0.9s steps(2, end) infinite;
+  --animate-burn: burn-cycle 0.9s steps(3, end) infinite;
+
+  @keyframes spin-slow {
+    from {
+      transform: rotate(0deg);
+    }
+    to {
+      transform: rotate(360deg);
+    }
+  }
+  @keyframes hard-pulse {
+    0%,
+    100% {
+      box-shadow: 6px 6px 0 0 #ff6b6b;
+      border-color: #ff6b6b;
+    }
+    50% {
+      box-shadow: 10px 10px 0 0 #000;
+      border-color: #000;
+    }
+  }
+  @keyframes flame-flicker {
+    0% {
+      transform: scale(1) rotate(-4deg);
+      opacity: 0.85;
+    }
+    50% {
+      transform: scale(1.18) rotate(3deg);
+      opacity: 1;
+    }
+  }
+  @keyframes burn-cycle {
+    0% {
+      box-shadow:
+        inset 0 0 0 3px #ff6b6b,
+        8px 8px 0 0 #000;
+      border-color: #ff6b6b;
+    }
+    34% {
+      box-shadow:
+        inset 0 0 0 3px #ff9f43,
+        8px 8px 0 0 #000;
+      border-color: #ff9f43;
+    }
+    67% {
+      box-shadow:
+        inset 0 0 0 3px #ffd93d,
+        8px 8px 0 0 #000;
+      border-color: #ffd93d;
+    }
+  }
+}
+
+html {
+  font-size: 115%;
+}
+
+body {
+  @apply bg-background text-foreground font-sans font-bold antialiased;
+}
+
+::selection {
+  background: #ffd93d;
+  color: #000;
+}
+
+::-webkit-scrollbar {
+  width: 12px;
+  height: 12px;
+}
+::-webkit-scrollbar-thumb {
+  background: #000;
+  border: 3px solid #fffdf5;
+}
+::-webkit-scrollbar-track {
+  background: #fffdf5;
+}
+
+.neo-shadow-sm {
+  box-shadow: 4px 4px 0 0 #000;
+}
+.neo-shadow-md {
+  box-shadow: 8px 8px 0 0 #000;
+}
+.neo-shadow-lg {
+  box-shadow: 12px 12px 0 0 #000;
+}
+.neo-push {
+  transition: transform 100ms linear, box-shadow 100ms linear;
+}
+.neo-push:active {
+  transform: translate(3px, 3px);
+  box-shadow: none !important;
+}
+.neo-lift {
+  transition:
+    transform 200ms ease-out,
+    box-shadow 200ms ease-out;
+}
+.neo-dots {
+  background-image: radial-gradient(#000 1.5px, transparent 1.5px);
+  background-size: 20px 20px;
+}
+.neo-grid {
+  background-size: 40px 40px;
+  background-image:
+    linear-gradient(to right, rgba(0, 0, 0, 0.08) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(0, 0, 0, 0.08) 1px, transparent 1px);
+}
+.neo-stroke-text {
+  -webkit-text-stroke: 2.5px #000;
+  color: transparent;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-spin-slow,
+  .animate-hard-pulse,
+  .animate-flame,
+  .animate-burn,
+  .animate-bounce,
+  .animate-pulse,
+  .flame-border,
+  .pflag:hover {
+    animation: none;
+  }
+}
+
+.flame-border {
+  animation: burn-cycle 0.9s steps(3, end) infinite !important;
+}
+.group:hover .pflag {
+  animation: wiggle 0.3s ease-in-out infinite alternate;
+}
+@keyframes wiggle {
+  from {
+    transform: rotate(-5deg) scale(1.05);
+  }
+  to {
+    transform: rotate(6deg) scale(1.1);
+  }
+}
+
+.react-flow__attribution {
+  background: transparent !important;
+  color: #000 !important;
+  font-weight: 700;
+}
+
+.react-flow__handle {
+  border-radius: 0 !important;
+  cursor: crosshair;
+}
+
+.react-flow__selection {
+  background: rgba(255, 217, 61, 0.35) !important;
+  border: 2px dashed #000 !important;
+}
+
+.node-card,
+.link-source,
+.link-target,
+.fresh-node {
+  border-radius: 0 !important;
+}
+
+.fresh-node {
+  outline: 4px solid #000;
+  outline-offset: 3px;
+  animation: fresh-glow 1.4s steps(2, end) infinite;
+}
+@keyframes fresh-glow {
+  0%,
+  100% {
+    outline-color: #000;
+    box-shadow: 8px 8px 0 0 #ffd93d;
+  }
+  50% {
+    outline-color: #ff6b6b;
+    box-shadow: 8px 8px 0 0 #ff6b6b;
+  }
+}
